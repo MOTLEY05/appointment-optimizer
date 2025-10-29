@@ -26,7 +26,7 @@ us_holidays = holidays.US()  # U.S. federal holidays
 # 🖼️ ADD LOGO (Local File Path)
 # ======================================
 # Local logo path (change if moved)
-LOGO_PATH = r"C:\Users\Kyle Motley\Pictures\Vivo.png"
+LOGO_PATH = "Vivo.png"
 
 try:
     logo = Image.open(LOGO_PATH)
