@@ -1,4 +1,6 @@
 streamlit
 pandas
 requests
+holidays
+Pillow
 openpyxl
