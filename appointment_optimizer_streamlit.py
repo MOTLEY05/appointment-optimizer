@@ -28,7 +28,7 @@ us_holidays = holidays.US()
 # ======================================
 # 🖼️ LOGO
 # ======================================
-LOGO_PATH = r"C:\Users\Kyle Motley\Pictures\Vivo.png"
+LOGO_PATH = "Vivo.png"
 try:
     logo = Image.open(LOGO_PATH)
     st.image(logo, width=180)
