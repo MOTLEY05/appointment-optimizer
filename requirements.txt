@@ -3,3 +3,4 @@ pandas
 requests
 holidays
 Pillow
+openpyxl
