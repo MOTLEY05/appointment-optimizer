@@ -40,9 +40,8 @@ except Exception as e:
 
 st.markdown("## Appointment Optimization Tool")
 st.write(
-    f"This app connects to Looker and optimizes appointments **within the next {OPTIMIZATION_WINDOW_DAYS} days**. "
-    "Total daily capacity = number of chairs × 9 hours (8 AM–5 PM). "
-    "All results exclude U.S. holidays and export a single `Rebalanced_Assigned` worksheet."
+    f"This app connects to Looker and identifies the **next three most optimal appointment days/times "
+    f"within {OPTIMIZATION_WINDOW_DAYS} days** for each location. Total daily capacity = number of chairs × 9 hours (8 AM–5 PM)."
 )
 
 # ======================================
@@ -78,7 +77,7 @@ def get_appointment_data(location_name):
 # 🧮 DATA PREPARATION + CAPACITY
 # ======================================
 def preprocess(df):
-    """Clean and filter appointments within 30 days of today."""
+    """Filter appointments within the next 30 days."""
     df = df[df["appointments.status"].isin(["Complete", "Active"])].copy()
     df["appointments.start_time"] = pd.to_datetime(df["appointments.start_time"])
     df["appointments.end_time"] = pd.to_datetime(df["appointments.end_time"])
@@ -88,17 +87,15 @@ def preprocess(df):
 
     today = date.today()
     cutoff = today + timedelta(days=OPTIMIZATION_WINDOW_DAYS)
-    # ✅ Include appointments between today and 30 days from now
     df = df[(df["Original_Date"] >= today) & (df["Original_Date"] <= cutoff)]
     df = df[~df["Original_Date"].isin(us_holidays)]
-
     df["Appt_ID"] = df.index
+
     return df[
         ["Appt_ID", "locations.name", "appointments.chair_id", "administration_details.med_name", "Duration", "Original_Date"]
     ].dropna()
 
 def calculate_capacity(df):
-    """Clinic capacity = #chairs × 540 minutes."""
     chair_counts = df.groupby("locations.name")["appointments.chair_id"].nunique().to_dict()
     return {loc: chairs * CLINIC_HOURS * MINUTES_PER_HOUR for loc, chairs in chair_counts.items()}
 
@@ -115,10 +112,10 @@ def calculate_utilization(df):
     return util
 
 # ======================================
-# 🧠 MULTI-DAY OPTIMIZATION LOGIC
+# 🧠 OPTIMIZATION — FIND 3 BEST DAYS
 # ======================================
-def multi_day_optimize(df, location, duration):
-    """Distribute appointments across top 3 optimal days (within 30 days)."""
+def find_top3_optimal_days(df, location, duration):
+    """Return only top 3 optimal appointment days and next available time."""
     util = calculate_utilization(df)
     today = datetime.now().date()
     cutoff = today + timedelta(days=OPTIMIZATION_WINDOW_DAYS)
@@ -129,51 +126,27 @@ def multi_day_optimize(df, location, duration):
         & (util["Original_Date"] <= cutoff)
     ].copy()
     loc_util = loc_util[~loc_util["Original_Date"].isin(us_holidays)]
+    loc_util = loc_util[loc_util["Remaining_Minutes"] >= duration]
+
     if loc_util.empty:
-        st.warning(f"No available capacity for {location} within 30 days.")
+        st.warning(f"No available appointment capacity for {location} within 30 days.")
         return pd.DataFrame()
 
-    # Rank top 3 days with most open time
-    loc_util = loc_util.sort_values("Remaining_Minutes", ascending=False).head(3)
-    day_caps = dict(zip(loc_util["Original_Date"], loc_util["Remaining_Minutes"]))
+    # Calculate next available start time within 8 AM–5 PM
+    total_day_minutes = CLINIC_HOURS * 60
+    loc_util["Utilization_Ratio"] = loc_util["Total_Minutes"] / loc_util["Available_Minutes"]
+    loc_util["Next_Start_Minute"] = loc_util["Utilization_Ratio"] * total_day_minutes
 
-    rebalanced = df.copy()
-    rebalanced["Assigned_Date"] = None
+    def compute_next_available(row):
+        next_time = datetime.combine(row["Original_Date"], CLINIC_START) + timedelta(minutes=row["Next_Start_Minute"])
+        if next_time.time() > CLINIC_END:
+            next_time = datetime.combine(row["Original_Date"], CLINIC_END)
+        return next_time.strftime("%I:%M %p")
 
-    # Assign appointments sequentially to the top 3 optimal days
-    for idx, row in rebalanced.iterrows():
-        for day in day_caps.keys():
-            if day_caps[day] >= row["Duration"]:
-                rebalanced.at[idx, "Assigned_Date"] = day
-                day_caps[day] -= row["Duration"]
-                break
+    loc_util["Next_Available_Time"] = loc_util.apply(compute_next_available, axis=1)
+    loc_util = loc_util.sort_values(by=["Original_Date", "Remaining_Minutes"], ascending=[True, False])
 
-    # Fallback: assign remaining to the most available day
-    rebalanced["Assigned_Date"] = rebalanced["Assigned_Date"].fillna(list(day_caps.keys())[-1])
-
-    rebalanced["Assigned_Date"] = pd.to_datetime(rebalanced["Assigned_Date"])
-    rebalanced["Original_Date"] = pd.to_datetime(rebalanced["Original_Date"])
-    rebalanced["Days_Moved"] = (rebalanced["Assigned_Date"] - rebalanced["Original_Date"]).dt.days
-    rebalanced["Created_At"] = datetime.today().date()
-
-    return rebalanced
-
-# ======================================
-# 📤 EXCEL EXPORT (REBALANCED_ASSIGNED)
-# ======================================
-def export_rebalanced_assigned(rebalanced, location):
-    """Write only Rebalanced_Assigned sheet."""
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        rebalanced.to_excel(writer, index=False, sheet_name="Rebalanced_Assigned")
-
-    output.seek(0)
-    st.download_button(
-        label="⬇️ Download Rebalanced_Assigned Excel",
-        data=output,
-        file_name=f"Optimized_Schedule_Rebalanced_{location}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    return loc_util.head(3)[["Original_Date", "Next_Available_Time", "Remaining_Minutes"]]
 
 # ======================================
 # 🖥️ STREAMLIT INTERFACE
@@ -201,15 +174,13 @@ if "data" in st.session_state:
     df = st.session_state["data"]
     duration = st.number_input("Appointment Duration (minutes)", min_value=1, max_value=540, value=60)
 
-    if st.button("📅 Optimize Next 3 Future Days (≤30 Days)"):
-        rebalanced_df = multi_day_optimize(df, location, duration)
-        if not rebalanced_df.empty:
-            st.subheader(f"Rebalanced Assignments — {location} (Within 30 Days)")
-            st.dataframe(rebalanced_df, use_container_width=True)
-            export_rebalanced_assigned(rebalanced_df, location)
+    if st.button("📅 Show Top 3 Optimal Appointment Days"):
+        results = find_top3_optimal_days(df, location, duration)
+        if not results.empty:
+            st.subheader(f"Next 3 Optimal Appointment Days — {location} (Within 30 Days)")
+            st.dataframe(results, use_container_width=True)
 else:
     st.info("Select a location and click **Load Schedule** to begin.")
 
 st.markdown("---")
 st.caption("Vivo Infusion | Appointment Optimization via Looker API © 2025")
-
