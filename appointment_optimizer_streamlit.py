@@ -11,8 +11,6 @@ import os
 from datetime import datetime, timedelta, date, time
 import holidays
 from PIL import Image
-from io import BytesIO
-import openpyxl
 
 # ======================================
 # 🔐 CONFIGURATION
@@ -25,7 +23,7 @@ CLINIC_HOURS = 9  # 8 AM–5 PM
 MINUTES_PER_HOUR = 60
 CLINIC_START = time(8, 0)
 CLINIC_END = time(17, 0)
-OPTIMIZATION_WINDOW_DAYS = 30
+OPTIMIZATION_WINDOW_DAYS = 30  # rolling window
 us_holidays = holidays.US()
 
 # ======================================
@@ -40,8 +38,9 @@ except Exception as e:
 
 st.markdown("## Appointment Optimization Tool")
 st.write(
-    f"This app connects to Looker and identifies the **next three most optimal appointment days/times "
-    f"within {OPTIMIZATION_WINDOW_DAYS} days** for each location. Total daily capacity = number of chairs × 9 hours (8 AM–5 PM)."
+    f"This app connects to Looker and identifies the **next three most optimal appointment times** "
+    f"by chair for each clinic within {OPTIMIZATION_WINDOW_DAYS} days (starting tomorrow). "
+    "Each chair has its own 9-hour capacity (8 AM–5 PM)."
 )
 
 # ======================================
@@ -77,7 +76,7 @@ def get_appointment_data(location_name):
 # 🧮 DATA PREPARATION + CAPACITY
 # ======================================
 def preprocess(df):
-    """Filter appointments within the next 30 days."""
+    """Filter appointments to tomorrow through the next 30 days."""
     df = df[df["appointments.status"].isin(["Complete", "Active"])].copy()
     df["appointments.start_time"] = pd.to_datetime(df["appointments.start_time"])
     df["appointments.end_time"] = pd.to_datetime(df["appointments.end_time"])
@@ -85,7 +84,7 @@ def preprocess(df):
     df["Original_Date"] = df["appointments.start_time"].dt.date
     df["Duration"] = (df["appointments.end_time"] - df["appointments.start_time"]).dt.total_seconds() / 60
 
-    today = date.today()
+    today = date.today() + timedelta(days=1)
     cutoff = today + timedelta(days=OPTIMIZATION_WINDOW_DAYS)
     df = df[(df["Original_Date"] >= today) & (df["Original_Date"] <= cutoff)]
     df = df[~df["Original_Date"].isin(us_holidays)]
@@ -95,29 +94,25 @@ def preprocess(df):
         ["Appt_ID", "locations.name", "appointments.chair_id", "administration_details.med_name", "Duration", "Original_Date"]
     ].dropna()
 
-def calculate_capacity(df):
-    chair_counts = df.groupby("locations.name")["appointments.chair_id"].nunique().to_dict()
-    return {loc: chairs * CLINIC_HOURS * MINUTES_PER_HOUR for loc, chairs in chair_counts.items()}
-
-def calculate_utilization(df):
+def calculate_utilization_by_chair(df):
+    """Calculate utilization per chair per day (540 minutes max each)."""
     util = (
-        df.groupby(["locations.name", "Original_Date"])
+        df.groupby(["locations.name", "appointments.chair_id", "Original_Date"])
         .agg(Total_Minutes=("Duration", "sum"))
         .reset_index()
     )
-    cap = calculate_capacity(df)
-    util["Available_Minutes"] = util["locations.name"].map(cap)
+    util["Available_Minutes"] = CLINIC_HOURS * 60  # 540 minutes per chair
     util["Remaining_Minutes"] = util["Available_Minutes"] - util["Total_Minutes"]
     util["Remaining_Minutes"] = util["Remaining_Minutes"].clip(lower=0)
     return util
 
 # ======================================
-# 🧠 OPTIMIZATION — FIND 3 BEST DAYS
+# 🧠 OPTIMIZATION — FIND 3 BEST CHAIRS/DAYS
 # ======================================
-def find_top3_optimal_days(df, location, duration):
-    """Return only top 3 optimal appointment days and next available time."""
-    util = calculate_utilization(df)
-    today = datetime.now().date()
+def find_top3_optimal_chairs(df, location, duration):
+    """Find next 3 most optimal chair/day combos."""
+    util = calculate_utilization_by_chair(df)
+    today = datetime.now().date() + timedelta(days=1)
     cutoff = today + timedelta(days=OPTIMIZATION_WINDOW_DAYS)
 
     loc_util = util[
@@ -129,10 +124,10 @@ def find_top3_optimal_days(df, location, duration):
     loc_util = loc_util[loc_util["Remaining_Minutes"] >= duration]
 
     if loc_util.empty:
-        st.warning(f"No available appointment capacity for {location} within 30 days.")
+        st.warning(f"No available chair capacity for {location} within next 30 days.")
         return pd.DataFrame()
 
-    # Calculate next available start time within 8 AM–5 PM
+    # Calculate next available start time for each chair/day
     total_day_minutes = CLINIC_HOURS * 60
     loc_util["Utilization_Ratio"] = loc_util["Total_Minutes"] / loc_util["Available_Minutes"]
     loc_util["Next_Start_Minute"] = loc_util["Utilization_Ratio"] * total_day_minutes
@@ -144,9 +139,11 @@ def find_top3_optimal_days(df, location, duration):
         return next_time.strftime("%I:%M %p")
 
     loc_util["Next_Available_Time"] = loc_util.apply(compute_next_available, axis=1)
-    loc_util = loc_util.sort_values(by=["Original_Date", "Remaining_Minutes"], ascending=[True, False])
 
-    return loc_util.head(3)[["Original_Date", "Next_Available_Time", "Remaining_Minutes"]]
+    loc_util = loc_util.sort_values(by=["Original_Date", "Remaining_Minutes"], ascending=[True, False])
+    return loc_util.head(3)[
+        ["Original_Date", "appointments.chair_id", "Next_Available_Time", "Remaining_Minutes"]
+    ]
 
 # ======================================
 # 🖥️ STREAMLIT INTERFACE
@@ -174,10 +171,10 @@ if "data" in st.session_state:
     df = st.session_state["data"]
     duration = st.number_input("Appointment Duration (minutes)", min_value=1, max_value=540, value=60)
 
-    if st.button("📅 Show Top 3 Optimal Appointment Days"):
-        results = find_top3_optimal_days(df, location, duration)
+    if st.button("📅 Show Top 3 Optimal Chair/Days"):
+        results = find_top3_optimal_chairs(df, location, duration)
         if not results.empty:
-            st.subheader(f"Next 3 Optimal Appointment Days — {location} (Within 30 Days)")
+            st.subheader(f"Next 3 Optimal Chair Appointment Days — {location} (Starting Tomorrow)")
             st.dataframe(results, use_container_width=True)
 else:
     st.info("Select a location and click **Load Schedule** to begin.")
